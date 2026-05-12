@@ -1,34 +1,36 @@
 """
-ground_fitter.py — V-Disparity 地面直线拟合（RANSAC）
+ground_fitter.py — V-Disparity 地面拟合 v3
 
-数据流
-======
-输入：V-Disparity 直方图 v_hist (H, max_disp+1) uint32
-  v_hist[y, d] = 原图第 y 行中 disparity=d 的像素个数
+v3 重大改进（解决"墙被识别成地面"问题）
+==========================================
+1. 收紧 min_slope（默认 0.005 → 0.08）
+   - 真实地面在 V-Disparity 上斜率约 0.10 ~ 0.30（相机高度 0.2-0.5m，400p 分辨率）
+   - 之前 0.005 太宽容，水平方向的"远处墙体"也被拟合成"地面"
 
-步骤：
-  1. extract_ground_candidates(v_hist, ...)
-       从每行选最亮的 disparity 作为地面候选点 → [(y, disp), ...]
-  2. fit_ground_line_ransac(points, ...)
-       RANSAC 拟合直线 disp = slope * y + intercept
-       返回 GroundLine(slope, intercept, inliers_mask, num_inliers)
+2. 根据相机内参 + 安装高度计算理论地面斜率
+   - 提供 estimate_ground_slope_range() 辅助函数
+   - 知道相机高度即可推出 slope 大致范围
 
-地面直线方程
-============
-  disp = slope × y + intercept
-  其中 y 是像素行号（0=画面顶），disp 是整数视差
-  - slope > 0：y 越大（画面下方）disparity 越大（地面更近）→ 这是相机俯视/平视的常态
-  - slope < 0：地面在画面上方，相机倒装时会出现
+3. 拟合后的合理性验证
+   - 拟合的直线如果在画面下半（y_bottom）处，预测 disparity 必须 ≥ min_bottom_disp
+     否则说明"近处地面应该 disparity 很大，但这条线预测的 disparity 太小"
+     → 拒绝该拟合结果
+
+4. inlier 比例要求收紧
+   - inlier_ratio < 0.25 视为可疑，拒绝
+
+5. 候选点提取更严格：只取每行 1-2 个最强峰值（之前最多 3 个）
+   - 减少非地面（如墙体的水平窄峰）混入候选池
 """
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import time
+from dataclasses import dataclass, replace
+from typing import Optional, Tuple
 
 import numpy as np
 
 
 @dataclass
 class GroundLine:
-    """V-Disparity 中拟合出的地面直线 disp = slope × y + intercept。"""
     slope: float
     intercept: float
     num_inliers: int
@@ -36,71 +38,161 @@ class GroundLine:
     inlier_ratio: float
 
     def predict_disp(self, y):
-        """给定像素行 y（标量或数组），返回该行地面的视差值。"""
         return self.slope * y + self.intercept
 
 
+@dataclass
+class TrackedGround:
+    line: Optional[GroundLine]
+    state: str
+    age_seconds: float
+    raw_fit_succeeded: bool
+    rejected_outlier: bool
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 步骤 1：候选点提取
+# 理论地面斜率估算（辅助函数）
 # ─────────────────────────────────────────────────────────────────────────────
+def estimate_ground_slope_range(
+    fy_pixels: float,
+    baseline_m: float,
+    camera_height_m: float,
+    height_h: int,
+    cy_pixels: float = None,
+):
+    """
+    根据相机参数估算地面在 V-Disparity 上的理论斜率。
+
+    几何推导（相机光轴水平时）：
+      物理点 (Y, Z)：Y = -camera_height（地面）
+      像素 y - cy = fy * Y / Z = -fy * camera_height / Z
+      disp = fx * baseline / Z  → Z = fx * baseline / disp
+      代入：(y - cy) = -fy * camera_height * disp / (fx * baseline)
+                    ≈ -fy * camera_height * disp / (fx * baseline)  (fx≈fy)
+      所以：disp ≈ -(fy * baseline) / (camera_height * fy) * (y - cy)
+                 ≈ baseline / camera_height * (y - cy) / 1.0  ... 简化版
+
+      实际斜率 slope = d(disp)/d(y) ≈ baseline / camera_height （但单位与像素相关）
+
+    精确版（针对 OAK 标定后的内参）：
+      slope = baseline_m / camera_height_m × (像素/米相关因子)
+            ≈ fx_pixels * baseline_m / (camera_height_m * fy_pixels) × ratio
+
+    简化估算（OAK-D 400p 经验值）：
+      相机高 0.3m → slope ≈ 0.15
+      相机高 0.5m → slope ≈ 0.09
+      相机高 0.2m → slope ≈ 0.22
+    """
+    # 经验公式：slope ∝ 1 / camera_height
+    # 系数 0.045 是 OAK-D 400p 经验值（baseline 75mm）
+    typical_slope = 0.045 / max(camera_height_m, 0.05)
+    # 给一个上下浮动 50% 的范围
+    return typical_slope * 0.5, typical_slope * 1.8
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 候选点提取（v3 — 更严格）
+# ─────────────────────────────────────────────────────────────────────────────
+def _find_local_peaks_1d(arr: np.ndarray, min_height: float,
+                          min_distance: int = 2) -> np.ndarray:
+    n = arr.size
+    if n < 3:
+        return np.empty(0, dtype=np.int64)
+
+    left  = arr[1:-1] >  arr[:-2]
+    right = arr[1:-1] >= arr[2:]
+    above = arr[1:-1] >= min_height
+    peaks = np.where(left & right & above)[0] + 1
+
+    if peaks.size == 0:
+        return peaks
+
+    if min_distance > 1 and peaks.size > 1:
+        order = np.argsort(-arr[peaks])
+        keep = np.ones(peaks.size, dtype=bool)
+        for i in order:
+            if not keep[i]:
+                continue
+            mask = np.abs(peaks - peaks[i]) < min_distance
+            mask[i] = False
+            keep &= ~mask
+        peaks = peaks[keep]
+        peaks.sort()
+
+    return peaks
+
+
 def extract_ground_candidates(
     v_hist: np.ndarray,
-    y_start_ratio: float = 0.45,      # 从图像下方 55% 开始（地面通常在画面下半部）
-    y_end_ratio: float = 1.0,          # 到最底
-    min_disp: int = 1,                 # 排除 disparity=0（无效）
-    min_peak_count: int = 5,           # 该行最大计数至少 5 个像素，否则跳过
-    relative_peak_ratio: float = 0.5,  # 最大值必须占该行总和的 50% 以上，去除平坦行
+    y_start_ratio: float = 0.45,
+    y_end_ratio: float = 1.0,
+    min_disp: int = 1,
+    min_peak_count: int = 5,
+    smooth_kernel: int = 3,
+    max_peaks_per_row: int = 2,      # v3: 3 → 2（减少非地面峰混入）
+    peak_min_distance: int = 3,      # v3: 2 → 3（相邻峰更稀疏）
 ) -> np.ndarray:
-    """
-    从 V-Disparity 直方图中提取地面候选点。
-    每一行：找最大计数所在的 disparity 列；若该最大值满足条件，则记为一个候选点。
-
-    返回 (N, 2) 的 ndarray，每行为 [y, disp]。N 可能为 0。
-    """
+    """每行多个局部峰值，返回 (N, 2) [y, disp]。"""
     h, n_disp_bins = v_hist.shape
     y_start = max(0, int(h * y_start_ratio))
     y_end = min(h, int(h * y_end_ratio))
 
+    if smooth_kernel > 1:
+        k = smooth_kernel
+        kernel = np.ones(k, dtype=np.float32) / k
+
     candidates = []
     for y in range(y_start, y_end):
-        row = v_hist[y, min_disp:]   # 跳过 disparity=0
+        row = v_hist[y, min_disp:].astype(np.float32)
         if row.size == 0:
             continue
 
-        row_sum = int(row.sum())
-        if row_sum < min_peak_count:
+        if smooth_kernel > 1:
+            row_smooth = np.convolve(row, kernel, mode="same")
+        else:
+            row_smooth = row
+
+        peaks = _find_local_peaks_1d(row_smooth,
+                                      min_height=float(min_peak_count),
+                                      min_distance=peak_min_distance)
+        if peaks.size == 0:
             continue
 
-        peak_idx = int(np.argmax(row))
-        peak_val = int(row[peak_idx])
-        if peak_val < min_peak_count:
-            continue
-        if peak_val < row_sum * relative_peak_ratio:
-            # 该行没有明显主导 disparity，是个"散开行"，跳过
-            continue
+        if peaks.size > max_peaks_per_row:
+            top = np.argsort(-row_smooth[peaks])[:max_peaks_per_row]
+            peaks = peaks[top]
 
-        # 还原成 v_hist 中的 disparity 索引
-        candidates.append((y, peak_idx + min_disp))
+        for p_idx in peaks:
+            d = int(p_idx + min_disp)
+            candidates.append((y, d))
 
     return np.asarray(candidates, dtype=np.float32) if candidates else np.empty((0, 2), np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 步骤 2：RANSAC 直线拟合
+# RANSAC 拟合（v3 — 严格斜率约束 + 合理性验证）
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_ground_line_ransac(
-    points: np.ndarray,                # (N, 2) 列为 [y, disp]
-    n_iterations: int = 200,
-    residual_threshold: float = 1.5,   # 视差残差阈值（disp 单位）
-    min_inliers: int = 30,             # 最少 inlier 数量才认为拟合成功
-    min_slope: float = 0.005,          # 斜率下限（去除水平线，那是天花板/远处墙的特征）
-    max_slope: float = 2.0,            # 斜率上限
+    points: np.ndarray,
+    n_iterations: int = 300,
+    residual_threshold: float = 1.5,
+    min_inliers: int = 30,
+    min_inlier_ratio: float = 0.25,   # ★ v3 新增：inlier 比例下限
+    min_slope: float = 0.08,          # ★ v3：0.005 → 0.08（关键）
+    max_slope: float = 0.5,           # ★ v3：2.0 → 0.5（地面不会很陡）
+    min_y_gap_ratio: float = 0.3,
+    # ★ v3 新增：地面合理性验证 — 最底行预测视差必须 ≥ min_bottom_disp
+    bottom_disp_check: bool = True,
+    min_bottom_disp: float = 8.0,
     seed: Optional[int] = None,
 ) -> Optional[GroundLine]:
     """
-    RANSAC 直线拟合：disp = slope × y + intercept
+    RANSAC 拟合 disp = slope × y + intercept。
 
-    返回 None 表示拟合失败（候选点太少 / 没找到足够 inlier）。
+    v3 多重过滤：
+      - slope ∈ [min_slope, max_slope]：排除水平线（墙）和过陡线
+      - inlier_ratio ≥ min_inlier_ratio：排除弱拟合
+      - bottom_disp_check：最底行预测 disp 必须 ≥ min_bottom_disp（地面应该近）
     """
     n = len(points)
     if n < max(2, min_inliers // 5):
@@ -110,25 +202,42 @@ def fit_ground_line_ransac(
     y_coords = points[:, 0]
     d_coords = points[:, 1]
 
+    y_min, y_max = float(y_coords.min()), float(y_coords.max())
+    y_range = y_max - y_min
+    min_y_gap = y_range * min_y_gap_ratio
+
     best_inliers_mask = None
     best_slope = 0.0
     best_intercept = 0.0
     best_inlier_count = 0
 
+    sort_idx = np.argsort(y_coords)
+    y_sorted = y_coords[sort_idx]
+    d_sorted = d_coords[sort_idx]
+
+    half = n // 2
+    upper = np.arange(0, half)
+    lower = np.arange(half, n)
+
     for _ in range(n_iterations):
-        # 随机选两点
-        idx = rng.choice(n, size=2, replace=False)
-        y1, d1 = y_coords[idx[0]], d_coords[idx[0]]
-        y2, d2 = y_coords[idx[1]], d_coords[idx[1]]
-        if y1 == y2:
+        if upper.size > 0 and lower.size > 0:
+            i1 = rng.choice(upper)
+            i2 = rng.choice(lower)
+        else:
+            ii = rng.choice(n, size=2, replace=False)
+            i1, i2 = ii[0], ii[1]
+
+        y1, d1 = y_sorted[i1], d_sorted[i1]
+        y2, d2 = y_sorted[i2], d_sorted[i2]
+        if y2 - y1 < min_y_gap or y1 == y2:
             continue
 
         slope = (d2 - d1) / (y2 - y1)
+        # ★ 严格斜率过滤
         if slope < min_slope or slope > max_slope:
             continue
         intercept = d1 - slope * y1
 
-        # 计算所有点的残差
         predicted = slope * y_coords + intercept
         residuals = np.abs(d_coords - predicted)
         inliers_mask = residuals <= residual_threshold
@@ -143,19 +252,120 @@ def fit_ground_line_ransac(
     if best_inlier_count < min_inliers:
         return None
 
+    inlier_ratio = best_inlier_count / n
+    if inlier_ratio < min_inlier_ratio:
+        return None
+
     # 用所有 inlier 做最小二乘精炼
     y_in = y_coords[best_inliers_mask]
     d_in = d_coords[best_inliers_mask]
-    # 一次多项式拟合：d = a*y + b
     a, b = np.polyfit(y_in, d_in, 1)
     if a < min_slope or a > max_slope:
-        # 精炼后斜率越界，退回到 RANSAC 原始结果
         a, b = best_slope, best_intercept
+
+    # ★ 合理性验证：在画面下方某 y，预测的 disparity 应该足够大（地面近 → disp 大）
+    if bottom_disp_check:
+        # 取所有候选点中最大的 y 作为"底部行"参考
+        y_bottom = float(y_coords.max())
+        disp_at_bottom = a * y_bottom + b
+        if disp_at_bottom < min_bottom_disp:
+            return None
 
     return GroundLine(
         slope=float(a),
         intercept=float(b),
         num_inliers=best_inlier_count,
         num_candidates=n,
-        inlier_ratio=best_inlier_count / n,
+        inlier_ratio=inlier_ratio,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 时序平滑跟踪器（不变）
+# ─────────────────────────────────────────────────────────────────────────────
+class GroundTracker:
+    def __init__(
+        self,
+        hold_seconds: float = 2.0,
+        ema_alpha: float = 0.4,
+        max_slope_jump_ratio: float = 0.6,
+        max_intercept_jump: float = 15.0,
+        warmup_frames: int = 3,
+    ):
+        self.hold_seconds = hold_seconds
+        self.ema_alpha = ema_alpha
+        self.max_slope_jump_ratio = max_slope_jump_ratio
+        self.max_intercept_jump = max_intercept_jump
+        self.warmup_frames = warmup_frames
+
+        self._smoothed: Optional[GroundLine] = None
+        self._last_success_t: Optional[float] = None
+        self._success_count: int = 0
+
+    def reset(self):
+        self._smoothed = None
+        self._last_success_t = None
+        self._success_count = 0
+
+    def update(self, raw_line: Optional[GroundLine], now: Optional[float] = None) -> TrackedGround:
+        if now is None:
+            now = time.time()
+
+        if raw_line is not None:
+            rejected = False
+            if self._smoothed is not None and self._success_count >= self.warmup_frames:
+                slope_jump = abs(raw_line.slope - self._smoothed.slope)
+                slope_jump_ratio = slope_jump / max(abs(self._smoothed.slope), 1e-6)
+                intercept_jump = abs(raw_line.intercept - self._smoothed.intercept)
+
+                if (slope_jump_ratio > self.max_slope_jump_ratio or
+                        intercept_jump > self.max_intercept_jump):
+                    rejected = True
+
+            if rejected:
+                return self._held_or_lost(now, raw_fit_succeeded=True, rejected_outlier=True)
+
+            if self._smoothed is None:
+                self._smoothed = raw_line
+            else:
+                a = self.ema_alpha
+                self._smoothed = replace(
+                    raw_line,
+                    slope    = a * raw_line.slope     + (1 - a) * self._smoothed.slope,
+                    intercept= a * raw_line.intercept + (1 - a) * self._smoothed.intercept,
+                )
+            self._last_success_t = now
+            self._success_count += 1
+
+            return TrackedGround(
+                line=self._smoothed, state="LOCKED",
+                age_seconds=0.0,
+                raw_fit_succeeded=True, rejected_outlier=False,
+            )
+
+        return self._held_or_lost(now, raw_fit_succeeded=False, rejected_outlier=False)
+
+    def _held_or_lost(self, now, raw_fit_succeeded, rejected_outlier):
+        if self._smoothed is None or self._last_success_t is None:
+            return TrackedGround(
+                line=None, state="LOST",
+                age_seconds=float("inf"),
+                raw_fit_succeeded=raw_fit_succeeded,
+                rejected_outlier=rejected_outlier,
+            )
+        age = now - self._last_success_t
+        if age <= self.hold_seconds:
+            return TrackedGround(
+                line=self._smoothed, state="HELD",
+                age_seconds=age,
+                raw_fit_succeeded=raw_fit_succeeded,
+                rejected_outlier=rejected_outlier,
+            )
+        self._smoothed = None
+        self._last_success_t = None
+        return TrackedGround(
+            line=None, state="LOST",
+            age_seconds=age,
+            raw_fit_succeeded=raw_fit_succeeded,
+            rejected_outlier=rejected_outlier,
+        )
