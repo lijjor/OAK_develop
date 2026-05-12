@@ -1,31 +1,13 @@
 """
-uv_disparity.py — U/V-Disparity 观察工具 + 地面拟合可视化
+uv_disparity.py — U/V-Disparity 观察 + 地面拟合 v3
 
-用途
-====
-1. 提供 compute_v_disparity / compute_u_disparity / render_hist 三个纯函数,
-   主代码 get_depth_claude_avoid.py 将来需要时直接 from uv_disparity import ...
-2. 自带 main() 可以独立跑起来验证效果 —— 但管道参数与主代码完全一致,
-   所以这里看到的 disparity 与主代码看到的 disparity 完全等价。
-3. ★ 新增：在 V-Disparity 窗口上实时叠加 RANSAC 拟合出的地面直线（青色）+
-   候选点（黄色）+ inlier 点（绿色），用于评估拟合效果。
-
-★ 管道参数对齐说明
-==================
-下列参数必须与 get_depth_claude_avoid.py / get_depth_claude.py 保持一致:
-  - confidence_threshold = 240
-  - median_filter        = KERNEL_7x7
-  - enable_lrc           = True, lrc_threshold = 10
-  - enable_subpixel      = False (默认)
-  - enable_extended      = False (默认)
-  - bilateral_sigma      = 0
-  - spatial_hole_fill    = 2  (温和)
-  - spatial_iterations   = 1  (温和)
-  - speckle_range        = 50
-  - threshold filter     = 200..10000 mm
-  - setRectifyEdgeFillColor(0)
-  - 默认不开 RGB-Depth 对齐
-任何主代码参数变更请同步到这里, 否则两边 disparity 不一致, 观察结果失真。
+v3 重大改动
+============
+1. 默认 min_slope 从 0.005 大幅提高到 0.08（关键）
+   - 真实地面斜率约 0.10-0.30，远低于此的"线"是墙体/天花板
+2. 新增 --cam-height-m 参数，用于在终端提示理论斜率范围
+3. 新增 --gnd-min-bottom-disp（地面合理性验证）
+4. 收紧 inlier 比例下限
 """
 import argparse
 import time
@@ -36,12 +18,13 @@ import depthai as dai
 import numpy as np
 
 from ground_fitter import (
-    extract_ground_candidates, fit_ground_line_ransac, GroundLine,
+    extract_ground_candidates, fit_ground_line_ransac,
+    GroundTracker, TrackedGround, estimate_ground_slope_range,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UV-Disparity 计算（纯函数，主代码可直接 import 复用）
+# UV-Disparity 计算
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_v_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
     h, _ = disp_int.shape
@@ -65,8 +48,7 @@ def compute_u_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
     return u_hist
 
 
-def disparity_to_int(disp_frame: np.ndarray, max_disp: int,
-                     subpixel_scale: int = 1) -> np.ndarray:
+def disparity_to_int(disp_frame, max_disp, subpixel_scale=1):
     if subpixel_scale > 1:
         disp_int = disp_frame.astype(np.int32) // subpixel_scale
     else:
@@ -74,8 +56,7 @@ def disparity_to_int(disp_frame: np.ndarray, max_disp: int,
     return np.clip(disp_int, 0, max_disp)
 
 
-def render_hist(hist: np.ndarray, axis: str, target_size,
-                log_scale: bool = True, colormap: int = cv2.COLORMAP_HOT) -> np.ndarray:
+def render_hist(hist, axis, target_size, log_scale=True, colormap=cv2.COLORMAP_HOT):
     img = hist.astype(np.float32)
     if log_scale:
         img = np.log1p(img)
@@ -84,7 +65,6 @@ def render_hist(hist: np.ndarray, axis: str, target_size,
     colored = cv2.applyColorMap(img_u8, colormap)
     if target_size is not None:
         colored = cv2.resize(colored, target_size, interpolation=cv2.INTER_NEAREST)
-
     label = "V-Disparity (X=disp, Y=row)" if axis == "v" else "U-Disparity (X=col, Y=disp)"
     h, w = colored.shape[:2]
     cv2.rectangle(colored, (0, 0), (w, 18), (0, 0, 0), -1)
@@ -94,25 +74,21 @@ def render_hist(hist: np.ndarray, axis: str, target_size,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ★ 地面拟合可视化：在 V-Disparity 显示图上叠加候选点 + inlier + 拟合直线
+# 地面拟合可视化
 # ─────────────────────────────────────────────────────────────────────────────
-def overlay_ground_line(
-    v_disp_img: np.ndarray,           # 已 render_hist 上色并 resize 过的 BGR 图
-    v_hist_shape,                     # (H_disp, max_disp+1)：v_hist 原始尺寸
-    candidates: np.ndarray,           # (N, 2) [y, disp]，可能为空
-    line: GroundLine,                 # 可能为 None
-    inliers_mask: np.ndarray = None,  # bool (N,)，可选
-):
-    """
-    把候选点（黄）、inlier 点（绿）、拟合直线（青）画到 v_disp_img 上。
-    v_disp_img 是显示尺寸，需要把 v_hist 坐标映射到显示坐标。
-    """
+STATE_LINE_COLOR = {
+    "LOCKED": (255, 255, 0),
+    "HELD":   (0, 165, 255),
+    "LOST":   (0, 0, 255),
+}
+
+
+def overlay_ground_line(v_disp_img, v_hist_shape, candidates, tracked, inliers_mask=None):
     disp_h, max_disp_plus_1 = v_hist_shape
     img_h, img_w = v_disp_img.shape[:2]
     sx = img_w / max_disp_plus_1
     sy = img_h / disp_h
 
-    # 候选点（黄）
     if candidates is not None and len(candidates) > 0:
         for i, (y, d) in enumerate(candidates):
             color = (0, 255, 0) if (inliers_mask is not None and inliers_mask[i]) else (0, 255, 255)
@@ -120,52 +96,50 @@ def overlay_ground_line(
             cy = int(y * sy + sy / 2)
             cv2.circle(v_disp_img, (cx, cy), 1, color, -1, cv2.LINE_AA)
 
-    # 拟合直线（青色，鲜艳）
-    if line is not None:
-        # 在 v_hist 坐标系下，直线 disp = slope*y + intercept，y ∈ [0, disp_h-1]
+    line = tracked.line
+    state = tracked.state
+    line_color = STATE_LINE_COLOR.get(state, (255, 255, 255))
+
+    if line is not None and state in ("LOCKED", "HELD"):
         y_top, y_bot = 0, disp_h - 1
         d_top = line.slope * y_top + line.intercept
         d_bot = line.slope * y_bot + line.intercept
-        # 映射到显示坐标
         pt1 = (int(d_top * sx + sx / 2), int(y_top * sy + sy / 2))
         pt2 = (int(d_bot * sx + sx / 2), int(y_bot * sy + sy / 2))
-        cv2.line(v_disp_img, pt1, pt2, (255, 255, 0), 2, cv2.LINE_AA)  # 青色
+        cv2.line(v_disp_img, pt1, pt2, line_color, 2, cv2.LINE_AA)
 
-        # 拟合信息文字
-        info = f"slope={line.slope:.3f} intercept={line.intercept:.1f} " \
-               f"inliers={line.num_inliers}/{line.num_candidates} ({line.inlier_ratio*100:.0f}%)"
-        cv2.rectangle(v_disp_img, (0, img_h - 22), (img_w, img_h), (0, 0, 0), -1)
-        cv2.putText(v_disp_img, info, (5, img_h - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.rectangle(v_disp_img, (0, img_h - 38), (img_w, img_h), (0, 0, 0), -1)
+    n_cand = 0 if candidates is None else len(candidates)
+    if line is not None:
+        row1 = f"[{state}] slope={line.slope:.3f} intercept={line.intercept:.1f}"
+        if state == "HELD":
+            row1 += f"  age={tracked.age_seconds:.1f}s"
+        elif state == "LOCKED":
+            row1 += f"  inl={line.num_inliers}/{line.num_candidates}({line.inlier_ratio*100:.0f}%)"
     else:
-        cv2.rectangle(v_disp_img, (0, img_h - 22), (img_w, img_h), (0, 0, 0), -1)
-        cv2.putText(v_disp_img, "Ground fit: FAILED", (5, img_h - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+        row1 = f"[{state}] no ground line  (cands={n_cand})"
+
+    extra_marks = []
+    if tracked.rejected_outlier:
+        extra_marks.append("OUTLIER_REJECTED")
+    if not tracked.raw_fit_succeeded and state != "LOST":
+        extra_marks.append("raw_fail")
+    row2 = " ".join(extra_marks)
+
+    cv2.putText(v_disp_img, row1, (5, img_h - 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, line_color, 1, cv2.LINE_AA)
+    if row2:
+        cv2.putText(v_disp_img, row2, (5, img_h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
 
 
-def overlay_ground_on_disparity(
-    disp_color: np.ndarray,           # 原 disparity 上色图
-    line: GroundLine,                 # 拟合的地面直线（v_hist 坐标系）
-    depth_h: int,                     # depth/disparity 原始高度
-    color=(0, 255, 255),              # 黄色
-    thickness: int = 1,
-):
-    """
-    把"每行预测的地面 disparity 位置"标记到原 disparity 显示图上。
-    实际上是把斜线投回到原图：对于每个像素行 y，地面 disparity = line.predict(y)
-    但这只是 V-Disparity 中的拟合信息，画到原图上意义有限。
-    简化：画一条水平参考线，标注地面起始行（disp = 0 对应的 y）。
-    实际不画水平线，只标"开始有地面信号的 y"用于参考。
-    """
-    if line is None:
+def overlay_ground_on_disparity(disp_color, tracked, depth_h, thickness=1):
+    line = tracked.line
+    if line is None or abs(line.slope) < 1e-6:
         return
-    # 求 line 在 depth 坐标系下的"地面起始 y"：disp = min_useful_disp (例如 5)
-    # 即 y = (5 - intercept) / slope
-    if abs(line.slope) < 1e-6:
-        return
+    color = STATE_LINE_COLOR.get(tracked.state, (255, 255, 255))
     img_h, img_w = disp_color.shape[:2]
     sy = img_h / depth_h
-    # 标 disparity = 5, 15, 25 对应的 y 行（不同距离的地面位置）
     for d_mark in (5, 15, 25):
         y_pred = (d_mark - line.intercept) / line.slope
         if 0 <= y_pred < depth_h:
@@ -259,8 +233,6 @@ def create_depth_pipeline_aligned_with_main(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 显示工具
-# ─────────────────────────────────────────────────────────────────────────────
 def build_colormap_with_zero_black(cv_colormap_id=cv2.COLORMAP_JET):
     color_map = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cv_colormap_id)
     color_map[0] = [0, 0, 0]
@@ -293,7 +265,7 @@ _MEDIAN_MAP = {
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="UV-Disparity 观察 + 地面 RANSAC 拟合")
+    p = argparse.ArgumentParser(description="UV-Disparity + 地面 RANSAC v3")
     p.add_argument("--resolution", choices=list(_RESOLUTION_MAP.keys()), default="400p")
     p.add_argument("--confidence", type=int, default=240)
     p.add_argument("--median", choices=list(_MEDIAN_MAP.keys()), default="7")
@@ -309,7 +281,6 @@ def parse_args():
     p.add_argument("--aggressive", action="store_true")
     p.add_argument("--no-threshold", action="store_true")
 
-    # UV 显示相关
     p.add_argument("--colormap", choices=["JET", "TURBO", "HOT", "VIRIDIS"], default="JET")
     p.add_argument("--window-width", type=int, default=720)
     p.add_argument("--vdisp-width", type=int, default=400)
@@ -318,21 +289,38 @@ def parse_args():
     p.add_argument("--save-dir", type=str, default="")
     p.add_argument("--usb-speed", choices=["auto", "usb2", "usb3"], default="auto")
 
-    # ★ 地面拟合相关
-    p.add_argument("--no-ground-fit", action="store_true",
-                   help="关闭地面拟合可视化")
-    p.add_argument("--gnd-y-start", type=float, default=0.45,
-                   help="候选点提取的起始 y 比例（图像下方区域，默认 0.45）")
-    p.add_argument("--gnd-relative-peak", type=float, default=0.5,
-                   help="行内峰值占比阈值（默认 0.5，越小越容易接受散开行）")
-    p.add_argument("--gnd-min-peak-count", type=int, default=5,
-                   help="行峰值最小像素数（默认 5）")
-    p.add_argument("--gnd-residual", type=float, default=1.5,
-                   help="RANSAC 残差阈值（视差单位，默认 1.5）")
-    p.add_argument("--gnd-iters", type=int, default=200,
-                   help="RANSAC 迭代次数（默认 200）")
-    p.add_argument("--gnd-min-inliers", type=int, default=30,
-                   help="最少 inlier 数才认为拟合成功（默认 30）")
+    # ★ 相机安装信息（用于辅助计算理论斜率）
+    p.add_argument("--cam-height-m", type=float, default=0.30,
+                   help="相机离地高度（米），用于估算地面斜率范围")
+
+    # 候选点提取
+    p.add_argument("--no-ground-fit", action="store_true")
+    p.add_argument("--gnd-y-start", type=float, default=0.45)
+    p.add_argument("--gnd-min-peak-count", type=int, default=5)
+    p.add_argument("--gnd-smooth-kernel", type=int, default=3)
+    p.add_argument("--gnd-max-peaks", type=int, default=2,
+                   help="每行最多取几个峰值（v3 默认 2）")
+    p.add_argument("--gnd-peak-distance", type=int, default=3)
+
+    # RANSAC（v3 严格默认）
+    p.add_argument("--gnd-residual", type=float, default=1.5)
+    p.add_argument("--gnd-iters", type=int, default=300)
+    p.add_argument("--gnd-min-inliers", type=int, default=30)
+    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.25,
+                   help="inlier 比例下限（默认 0.25）")
+    p.add_argument("--gnd-y-gap", type=float, default=0.3)
+    p.add_argument("--gnd-min-slope", type=float, default=0.08,
+                   help="地面斜率下限（v3 默认 0.08，大幅高于以前的 0.005）")
+    p.add_argument("--gnd-max-slope", type=float, default=0.5,
+                   help="地面斜率上限（默认 0.5）")
+    p.add_argument("--gnd-min-bottom-disp", type=float, default=8.0,
+                   help="拟合直线在最底行的最小预测视差（地面应该近=disp 大）")
+
+    # 时序平滑
+    p.add_argument("--track-hold-sec", type=float, default=2.0)
+    p.add_argument("--track-ema", type=float, default=0.4)
+    p.add_argument("--track-slope-jump", type=float, default=0.6)
+    p.add_argument("--track-intercept-jump", type=float, default=15.0)
     return p.parse_args()
 
 
@@ -382,16 +370,29 @@ def main():
     color_lut = build_colormap_with_zero_black(cv_cm_id)
     disp_color_mul = 255.0 / max_disparity
 
+    # 估算理论斜率范围
+    slope_lo, slope_hi = estimate_ground_slope_range(
+        fy_pixels=453.0, baseline_m=0.075,
+        camera_height_m=args.cam_height_m, height_h=400,
+    )
+
+    tracker = GroundTracker(
+        hold_seconds=args.track_hold_sec,
+        ema_alpha=args.track_ema,
+        max_slope_jump_ratio=args.track_slope_jump,
+        max_intercept_jump=args.track_intercept_jump,
+    )
+
     print("=" * 60)
-    print(" UV-Disparity 观察 + 地面 RANSAC 拟合")
+    print(" UV-Disparity + 地面 RANSAC v3")
     print("=" * 60)
-    print(f" 分辨率: {args.resolution}    confidence: {args.confidence}")
-    print(f" subpixel={args.subpixel}  extended={args.extended}  LRC={not args.no_lrc}")
+    print(f" 分辨率: {args.resolution}    相机高: {args.cam_height_m}m")
     print(f" 整数视差范围: 0..{int_max_disp}    subpixel_scale={subpixel_scale}")
-    print(f" 地面拟合: {'关' if args.no_ground_fit else '开'}  "
-          f"(y_start={args.gnd_y_start}, residual={args.gnd_residual}, "
-          f"iters={args.gnd_iters})")
-    print(" 按键: [q]退出 [s]保存 [l]切换log [+/-]调UV显示尺寸 [g]切换地面拟合")
+    print(f" 理论地面斜率: 约 {slope_lo:.3f} ~ {slope_hi:.3f}")
+    print(f" 拟合 slope 范围: [{args.gnd_min_slope}, {args.gnd_max_slope}]")
+    print(f" min_inlier_ratio: {args.gnd_min_inlier_ratio}   "
+          f"min_bottom_disp: {args.gnd_min_bottom_disp}")
+    print(" 按键: [q]退出 [s]保存 [l]切换log [g]切换拟合 [r]重置跟踪")
     print()
 
     if args.usb_speed == "usb2":
@@ -416,6 +417,8 @@ def main():
         vdisp_width = args.vdisp_width
         udisp_height = args.udisp_height
         do_ground_fit = not args.no_ground_fit
+        last_state_print_t = 0.0
+        last_state_str = ""
 
         while True:
             in_disp = disp_q.tryGet()
@@ -430,15 +433,11 @@ def main():
                 fps = fps_count / elapsed
                 fps_count, fps_start = 0, time.time()
 
-            # ── 主 disparity 上色 ──
             disp_u8 = np.clip(latest_disp * disp_color_mul, 0, 255).astype(np.uint8)
             disp_color = cv2.applyColorMap(disp_u8, color_lut)
             disp_shown = fit_to_window(disp_color, args.window_width)
 
-            # ── 反 subpixel 得整数视差 ──
             disp_int = disparity_to_int(latest_disp, int_max_disp, subpixel_scale)
-
-            # ── V/U 直方图 ──
             v_hist = compute_v_disparity(disp_int, int_max_disp)
             u_hist = compute_u_disparity(disp_int, int_max_disp)
             v_img = render_hist(v_hist, "v",
@@ -448,34 +447,58 @@ def main():
                                 target_size=(disp_shown.shape[1], udisp_height),
                                 log_scale=log_scale)
 
-            # ── ★ 地面拟合 ──
-            ground_line = None
+            tracked = TrackedGround(None, "LOST", float("inf"), False, False)
             candidates = np.empty((0, 2), np.float32)
             inliers_mask = None
+
             if do_ground_fit:
                 candidates = extract_ground_candidates(
                     v_hist,
                     y_start_ratio=args.gnd_y_start,
                     min_peak_count=args.gnd_min_peak_count,
-                    relative_peak_ratio=args.gnd_relative_peak,
+                    smooth_kernel=args.gnd_smooth_kernel,
+                    max_peaks_per_row=args.gnd_max_peaks,
+                    peak_min_distance=args.gnd_peak_distance,
                 )
+                raw_line = None
                 if len(candidates) >= args.gnd_min_inliers // 2:
-                    ground_line = fit_ground_line_ransac(
+                    raw_line = fit_ground_line_ransac(
                         candidates,
                         n_iterations=args.gnd_iters,
                         residual_threshold=args.gnd_residual,
                         min_inliers=args.gnd_min_inliers,
+                        min_inlier_ratio=args.gnd_min_inlier_ratio,
+                        min_slope=args.gnd_min_slope,
+                        max_slope=args.gnd_max_slope,
+                        min_y_gap_ratio=args.gnd_y_gap,
+                        min_bottom_disp=args.gnd_min_bottom_disp,
                     )
-                    # 重新计算 inliers_mask 用于显示
-                    if ground_line is not None:
-                        residuals = np.abs(
-                            candidates[:, 1] - (ground_line.slope * candidates[:, 0] + ground_line.intercept)
-                        )
-                        inliers_mask = residuals <= args.gnd_residual
+                tracked = tracker.update(raw_line)
 
-                overlay_ground_line(v_img, v_hist.shape, candidates, ground_line, inliers_mask)
-                # 在原 disparity 显示图上也叠加 d=5/15/25 的地面参考线
-                overlay_ground_on_disparity(disp_shown, ground_line, depth_h=v_hist.shape[0])
+                if raw_line is not None and len(candidates) > 0:
+                    residuals = np.abs(
+                        candidates[:, 1] - (raw_line.slope * candidates[:, 0] + raw_line.intercept)
+                    )
+                    inliers_mask = residuals <= args.gnd_residual
+
+                overlay_ground_line(v_img, v_hist.shape, candidates, tracked, inliers_mask)
+                overlay_ground_on_disparity(disp_shown, tracked, depth_h=v_hist.shape[0])
+
+                now = time.time()
+                state_str = f"{tracked.state}"
+                if tracked.line is not None:
+                    state_str += f"(slope={tracked.line.slope:.3f}, inter={tracked.line.intercept:.1f}"
+                    if tracked.state == "HELD":
+                        state_str += f", age={tracked.age_seconds:.1f}s"
+                    state_str += ")"
+                state_str += f"  cands={len(candidates)}"
+                if tracked.rejected_outlier:
+                    state_str += " [OUTLIER_REJECTED]"
+
+                if state_str != last_state_str or (now - last_state_print_t) > 2.0:
+                    print(f"[{time.strftime('%H:%M:%S')}] ground={state_str}")
+                    last_state_str = state_str
+                    last_state_print_t = now
 
             cv2.putText(disp_shown, f"FPS:{fps:.1f}", (10, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
@@ -500,6 +523,9 @@ def main():
             elif key == ord("g"):
                 do_ground_fit = not do_ground_fit
                 print(f"[显示] 地面拟合: {'开' if do_ground_fit else '关'}")
+            elif key == ord("r"):
+                tracker.reset()
+                print("[跟踪] 已重置")
             elif key in (ord("+"), ord("=")):
                 vdisp_width = min(vdisp_width + 50, 800)
                 udisp_height = min(udisp_height + 30, 500)
@@ -517,12 +543,12 @@ def main():
                     cv2.imwrite(str(save_dir / f"disp_{stamp}.png"), disp_shown)
                     cv2.imwrite(str(save_dir / f"vdisp_{stamp}.png"), v_img)
                     cv2.imwrite(str(save_dir / f"udisp_{stamp}.png"), u_img)
-                    if ground_line is not None:
+                    if tracked.line is not None:
                         with open(save_dir / f"ground_{stamp}.txt", "w") as f:
-                            f.write(f"slope={ground_line.slope:.6f}\n")
-                            f.write(f"intercept={ground_line.intercept:.6f}\n")
-                            f.write(f"inliers={ground_line.num_inliers}/{ground_line.num_candidates}\n")
-                            f.write(f"inlier_ratio={ground_line.inlier_ratio:.3f}\n")
+                            f.write(f"state={tracked.state}\n")
+                            f.write(f"slope={tracked.line.slope:.6f}\n")
+                            f.write(f"intercept={tracked.line.intercept:.6f}\n")
+                            f.write(f"age_seconds={tracked.age_seconds:.3f}\n")
                     print(f"[✓] 已保存到 {save_dir}（{stamp}）")
 
     cv2.destroyAllWindows()
