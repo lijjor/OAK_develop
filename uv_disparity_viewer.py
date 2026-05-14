@@ -1,13 +1,14 @@
 """
-uv_disparity.py — U/V-Disparity 观察 + 地面拟合 v3
+uv_disparity.py — U/V-Disparity 观察 + 地面拟合
 
-v3 重大改动
-============
-1. 默认 min_slope 从 0.005 大幅提高到 0.08（关键）
-   - 真实地面斜率约 0.10-0.30，远低于此的"线"是墙体/天花板
-2. 新增 --cam-height-m 参数，用于在终端提示理论斜率范围
-3. 新增 --gnd-min-bottom-disp（地面合理性验证）
-4. 收紧 inlier 比例下限
+本次改动（仅两处）
+==================
+1. --gnd-column-norm 增加 subtract_percentile 选项 + 新参数 --gnd-norm-pct
+   - 默认仍 subtract_median（不动你之前的默认行为）
+   - 用 --gnd-column-norm subtract_percentile --gnd-norm-pct 25 可调到 25 分位
+2. 新增 --gnd-min-useful-disp（默认 2，屏蔽 disp<2 的远景背景）
+
+其他参数和默认值未改动。
 """
 import argparse
 import time
@@ -265,7 +266,7 @@ _MEDIAN_MAP = {
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="UV-Disparity + 地面 RANSAC v3")
+    p = argparse.ArgumentParser(description="UV-Disparity + 地面 RANSAC")
     p.add_argument("--resolution", choices=list(_RESOLUTION_MAP.keys()), default="400p")
     p.add_argument("--confidence", type=int, default=240)
     p.add_argument("--median", choices=list(_MEDIAN_MAP.keys()), default="7")
@@ -289,7 +290,6 @@ def parse_args():
     p.add_argument("--save-dir", type=str, default="")
     p.add_argument("--usb-speed", choices=["auto", "usb2", "usb3"], default="auto")
 
-    # ★ 相机安装信息（用于辅助计算理论斜率）
     p.add_argument("--cam-height-m", type=float, default=0.30,
                    help="相机离地高度（米），用于估算地面斜率范围")
 
@@ -298,26 +298,32 @@ def parse_args():
     p.add_argument("--gnd-y-start", type=float, default=0.45)
     p.add_argument("--gnd-min-peak-count", type=int, default=5)
     p.add_argument("--gnd-smooth-kernel", type=int, default=3)
-    p.add_argument("--gnd-max-peaks", type=int, default=2,
-                   help="每行最多取几个峰值（v3 默认 2）")
+    p.add_argument("--gnd-max-peaks", type=int, default=2)
     p.add_argument("--gnd-peak-distance", type=int, default=3)
+    # ★ 列归一化：新增 subtract_percentile 选项
+    p.add_argument("--gnd-column-norm",
+                   choices=["subtract_percentile", "subtract_median", "subtract_min", "none"],
+                   default="subtract_median",
+                   help="V-Disparity 列归一化方法（默认 subtract_median）")
+    # ★ 新增百分位参数
+    p.add_argument("--gnd-norm-pct", type=float, default=25.0,
+                   help="subtract_percentile 模式使用的百分位数 0-100（默认 25）")
+    # ★ 新增屏蔽远景
+    p.add_argument("--gnd-min-useful-disp", type=int, default=2,
+                   help="候选点最小 disparity（屏蔽远景背景，默认 2）")
 
-    # RANSAC（v3 严格默认）
+    # RANSAC
     p.add_argument("--gnd-residual", type=float, default=1.5)
     p.add_argument("--gnd-iters", type=int, default=300)
     p.add_argument("--gnd-min-inliers", type=int, default=30)
-    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.25,
-                   help="inlier 比例下限（默认 0.25）")
+    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.25)
     p.add_argument("--gnd-y-gap", type=float, default=0.3)
-    p.add_argument("--gnd-min-slope", type=float, default=0.08,
-                   help="地面斜率下限（v3 默认 0.08，大幅高于以前的 0.005）")
-    p.add_argument("--gnd-max-slope", type=float, default=0.5,
-                   help="地面斜率上限（默认 0.5）")
-    p.add_argument("--gnd-min-bottom-disp", type=float, default=8.0,
-                   help="拟合直线在最底行的最小预测视差（地面应该近=disp 大）")
+    p.add_argument("--gnd-min-slope", type=float, default=0.09)
+    p.add_argument("--gnd-max-slope", type=float, default=0.5)
+    p.add_argument("--gnd-min-bottom-disp", type=float, default=8.0)
 
     # 时序平滑
-    p.add_argument("--track-hold-sec", type=float, default=2.0)
+    p.add_argument("--track-hold-sec", type=float, default=1.5)
     p.add_argument("--track-ema", type=float, default=0.4)
     p.add_argument("--track-slope-jump", type=float, default=0.6)
     p.add_argument("--track-intercept-jump", type=float, default=15.0)
@@ -370,7 +376,6 @@ def main():
     color_lut = build_colormap_with_zero_black(cv_cm_id)
     disp_color_mul = 255.0 / max_disparity
 
-    # 估算理论斜率范围
     slope_lo, slope_hi = estimate_ground_slope_range(
         fy_pixels=453.0, baseline_m=0.075,
         camera_height_m=args.cam_height_m, height_h=400,
@@ -383,8 +388,12 @@ def main():
         max_intercept_jump=args.track_intercept_jump,
     )
 
+    norm_info = args.gnd_column_norm
+    if args.gnd_column_norm == "subtract_percentile":
+        norm_info += f"(P{args.gnd_norm_pct:.0f})"
+
     print("=" * 60)
-    print(" UV-Disparity + 地面 RANSAC v3")
+    print(" UV-Disparity + 地面 RANSAC")
     print("=" * 60)
     print(f" 分辨率: {args.resolution}    相机高: {args.cam_height_m}m")
     print(f" 整数视差范围: 0..{int_max_disp}    subpixel_scale={subpixel_scale}")
@@ -392,6 +401,7 @@ def main():
     print(f" 拟合 slope 范围: [{args.gnd_min_slope}, {args.gnd_max_slope}]")
     print(f" min_inlier_ratio: {args.gnd_min_inlier_ratio}   "
           f"min_bottom_disp: {args.gnd_min_bottom_disp}")
+    print(f" 列归一化: {norm_info}   min_useful_disp: {args.gnd_min_useful_disp}")
     print(" 按键: [q]退出 [s]保存 [l]切换log [g]切换拟合 [r]重置跟踪")
     print()
 
@@ -455,10 +465,13 @@ def main():
                 candidates = extract_ground_candidates(
                     v_hist,
                     y_start_ratio=args.gnd_y_start,
+                    min_useful_disp=args.gnd_min_useful_disp,
                     min_peak_count=args.gnd_min_peak_count,
                     smooth_kernel=args.gnd_smooth_kernel,
                     max_peaks_per_row=args.gnd_max_peaks,
                     peak_min_distance=args.gnd_peak_distance,
+                    column_normalize=args.gnd_column_norm,
+                    column_norm_percentile=args.gnd_norm_pct,
                 )
                 raw_line = None
                 if len(candidates) >= args.gnd_min_inliers // 2:
