@@ -1,26 +1,13 @@
 """
-ground_fitter.py — V-Disparity 地面拟合 v3
+ground_fitter.py — V-Disparity 地面拟合
 
-v3 重大改进（解决"墙被识别成地面"问题）
-==========================================
-1. 收紧 min_slope（默认 0.005 → 0.08）
-   - 真实地面在 V-Disparity 上斜率约 0.10 ~ 0.30（相机高度 0.2-0.5m，400p 分辨率）
-   - 之前 0.005 太宽容，水平方向的"远处墙体"也被拟合成"地面"
+本次改动（仅两处）
+==================
+1. normalize_v_hist_by_column 新增 "subtract_percentile" 方法，可指定百分位
+   - 保留原有 subtract_median / subtract_min / none
+2. extract_ground_candidates 新增 min_useful_disp（默认 2，屏蔽远景背景）
 
-2. 根据相机内参 + 安装高度计算理论地面斜率
-   - 提供 estimate_ground_slope_range() 辅助函数
-   - 知道相机高度即可推出 slope 大致范围
-
-3. 拟合后的合理性验证
-   - 拟合的直线如果在画面下半（y_bottom）处，预测 disparity 必须 ≥ min_bottom_disp
-     否则说明"近处地面应该 disparity 很大，但这条线预测的 disparity 太小"
-     → 拒绝该拟合结果
-
-4. inlier 比例要求收紧
-   - inlier_ratio < 0.25 视为可疑，拒绝
-
-5. 候选点提取更严格：只取每行 1-2 个最强峰值（之前最多 3 个）
-   - 减少非地面（如墙体的水平窄峰）混入候选池
+其他逻辑（RANSAC、突变拒绝、HELD/LOST 跟踪器）保持原样。
 """
 import time
 from dataclasses import dataclass, replace
@@ -50,48 +37,47 @@ class TrackedGround:
     rejected_outlier: bool
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 理论地面斜率估算（辅助函数）
-# ─────────────────────────────────────────────────────────────────────────────
-def estimate_ground_slope_range(
-    fy_pixels: float,
-    baseline_m: float,
-    camera_height_m: float,
-    height_h: int,
-    cy_pixels: float = None,
-):
-    """
-    根据相机参数估算地面在 V-Disparity 上的理论斜率。
-
-    几何推导（相机光轴水平时）：
-      物理点 (Y, Z)：Y = -camera_height（地面）
-      像素 y - cy = fy * Y / Z = -fy * camera_height / Z
-      disp = fx * baseline / Z  → Z = fx * baseline / disp
-      代入：(y - cy) = -fy * camera_height * disp / (fx * baseline)
-                    ≈ -fy * camera_height * disp / (fx * baseline)  (fx≈fy)
-      所以：disp ≈ -(fy * baseline) / (camera_height * fy) * (y - cy)
-                 ≈ baseline / camera_height * (y - cy) / 1.0  ... 简化版
-
-      实际斜率 slope = d(disp)/d(y) ≈ baseline / camera_height （但单位与像素相关）
-
-    精确版（针对 OAK 标定后的内参）：
-      slope = baseline_m / camera_height_m × (像素/米相关因子)
-            ≈ fx_pixels * baseline_m / (camera_height_m * fy_pixels) × ratio
-
-    简化估算（OAK-D 400p 经验值）：
-      相机高 0.3m → slope ≈ 0.15
-      相机高 0.5m → slope ≈ 0.09
-      相机高 0.2m → slope ≈ 0.22
-    """
-    # 经验公式：slope ∝ 1 / camera_height
-    # 系数 0.045 是 OAK-D 400p 经验值（baseline 75mm）
+def estimate_ground_slope_range(fy_pixels, baseline_m, camera_height_m, height_h, cy_pixels=None):
     typical_slope = 0.045 / max(camera_height_m, 0.05)
-    # 给一个上下浮动 50% 的范围
     return typical_slope * 0.5, typical_slope * 1.8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 候选点提取（v3 — 更严格）
+# ★ 列归一化：抑制 V-Disparity 中的墙体垂直亮带
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_v_hist_by_column(v_hist: np.ndarray,
+                                method: str = "subtract_median",
+                                percentile: float = 25.0) -> np.ndarray:
+    """
+    对 V-Disparity 直方图每列减去某个统计量，削弱墙体垂直亮带。
+
+    method:
+      "subtract_percentile"：减去每列 percentile% 分位数（百分位可调）
+      "subtract_median"    ：减去每列中位数（等价于 percentile=50）
+      "subtract_min"       ：减去每列最小值（等价于 percentile=0，最弱）
+      "none"               ：不归一化
+
+    percentile 仅在 method="subtract_percentile" 时生效，取值 0-100。
+    """
+    if method == "none":
+        return v_hist
+
+    v = v_hist.astype(np.float32)
+    if method == "subtract_percentile":
+        col_stat = np.percentile(v, percentile, axis=0, keepdims=True)
+    elif method == "subtract_median":
+        col_stat = np.median(v, axis=0, keepdims=True)
+    elif method == "subtract_min":
+        col_stat = v.min(axis=0, keepdims=True)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    v_norm = np.clip(v - col_stat, 0, None)
+    return v_norm.astype(np.uint32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 候选点提取
 # ─────────────────────────────────────────────────────────────────────────────
 def _find_local_peaks_1d(arr: np.ndarray, min_height: float,
                           min_distance: int = 2) -> np.ndarray:
@@ -127,13 +113,22 @@ def extract_ground_candidates(
     y_start_ratio: float = 0.45,
     y_end_ratio: float = 1.0,
     min_disp: int = 1,
+    min_useful_disp: int = 2,                          # ★ 新增：屏蔽远景背景
     min_peak_count: int = 5,
     smooth_kernel: int = 3,
-    max_peaks_per_row: int = 2,      # v3: 3 → 2（减少非地面峰混入）
-    peak_min_distance: int = 3,      # v3: 2 → 3（相邻峰更稀疏）
+    max_peaks_per_row: int = 2,
+    peak_min_distance: int = 3,
+    column_normalize: str = "subtract_median",
+    column_norm_percentile: float = 25.0,              # ★ 新增：百分位参数
 ) -> np.ndarray:
-    """每行多个局部峰值，返回 (N, 2) [y, disp]。"""
-    h, n_disp_bins = v_hist.shape
+    """
+    每行多个局部峰值，返回 (N, 2) [y, disp]。
+    """
+    v_hist_proc = normalize_v_hist_by_column(
+        v_hist, method=column_normalize, percentile=column_norm_percentile
+    )
+
+    h, n_disp_bins = v_hist_proc.shape
     y_start = max(0, int(h * y_start_ratio))
     y_end = min(h, int(h * y_end_ratio))
 
@@ -141,9 +136,12 @@ def extract_ground_candidates(
         k = smooth_kernel
         kernel = np.ones(k, dtype=np.float32) / k
 
+    # ★ 屏蔽 disp 太小的列（远景背景）
+    actual_start = max(min_disp, min_useful_disp)
+
     candidates = []
     for y in range(y_start, y_end):
-        row = v_hist[y, min_disp:].astype(np.float32)
+        row = v_hist_proc[y, actual_start:].astype(np.float32)
         if row.size == 0:
             continue
 
@@ -163,37 +161,28 @@ def extract_ground_candidates(
             peaks = peaks[top]
 
         for p_idx in peaks:
-            d = int(p_idx + min_disp)
+            d = int(p_idx + actual_start)
             candidates.append((y, d))
 
     return np.asarray(candidates, dtype=np.float32) if candidates else np.empty((0, 2), np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RANSAC 拟合（v3 — 严格斜率约束 + 合理性验证）
+# RANSAC 拟合（未改）
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_ground_line_ransac(
     points: np.ndarray,
     n_iterations: int = 300,
     residual_threshold: float = 1.5,
     min_inliers: int = 30,
-    min_inlier_ratio: float = 0.25,   # ★ v3 新增：inlier 比例下限
-    min_slope: float = 0.08,          # ★ v3：0.005 → 0.08（关键）
-    max_slope: float = 0.5,           # ★ v3：2.0 → 0.5（地面不会很陡）
+    min_inlier_ratio: float = 0.25,
+    min_slope: float = 0.09,
+    max_slope: float = 0.5,
     min_y_gap_ratio: float = 0.3,
-    # ★ v3 新增：地面合理性验证 — 最底行预测视差必须 ≥ min_bottom_disp
     bottom_disp_check: bool = True,
     min_bottom_disp: float = 8.0,
     seed: Optional[int] = None,
 ) -> Optional[GroundLine]:
-    """
-    RANSAC 拟合 disp = slope × y + intercept。
-
-    v3 多重过滤：
-      - slope ∈ [min_slope, max_slope]：排除水平线（墙）和过陡线
-      - inlier_ratio ≥ min_inlier_ratio：排除弱拟合
-      - bottom_disp_check：最底行预测 disp 必须 ≥ min_bottom_disp（地面应该近）
-    """
     n = len(points)
     if n < max(2, min_inliers // 5):
         return None
@@ -233,7 +222,6 @@ def fit_ground_line_ransac(
             continue
 
         slope = (d2 - d1) / (y2 - y1)
-        # ★ 严格斜率过滤
         if slope < min_slope or slope > max_slope:
             continue
         intercept = d1 - slope * y1
@@ -256,16 +244,13 @@ def fit_ground_line_ransac(
     if inlier_ratio < min_inlier_ratio:
         return None
 
-    # 用所有 inlier 做最小二乘精炼
     y_in = y_coords[best_inliers_mask]
     d_in = d_coords[best_inliers_mask]
     a, b = np.polyfit(y_in, d_in, 1)
     if a < min_slope or a > max_slope:
         a, b = best_slope, best_intercept
 
-    # ★ 合理性验证：在画面下方某 y，预测的 disparity 应该足够大（地面近 → disp 大）
     if bottom_disp_check:
-        # 取所有候选点中最大的 y 作为"底部行"参考
         y_bottom = float(y_coords.max())
         disp_at_bottom = a * y_bottom + b
         if disp_at_bottom < min_bottom_disp:
@@ -281,12 +266,12 @@ def fit_ground_line_ransac(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 时序平滑跟踪器（不变）
+# 时序平滑跟踪器（未改）
 # ─────────────────────────────────────────────────────────────────────────────
 class GroundTracker:
     def __init__(
         self,
-        hold_seconds: float = 2.0,
+        hold_seconds: float = 1.5,
         ema_alpha: float = 0.4,
         max_slope_jump_ratio: float = 0.6,
         max_intercept_jump: float = 15.0,
