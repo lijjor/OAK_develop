@@ -1,13 +1,22 @@
 """
 ground_fitter.py — V-Disparity 地面拟合
 
-本次改动（仅两处）
-==================
-1. normalize_v_hist_by_column 新增 "subtract_percentile" 方法，可指定百分位
-   - 保留原有 subtract_median / subtract_min / none
-2. extract_ground_candidates 新增 min_useful_disp（默认 2，屏蔽远景背景）
+本次改动（仅 GroundTracker 一处）
+==================================
+新增 hold_min_inlier_ratio（默认 0.45）：只有"高质量拟合"才配进入 HELD 持有。
 
-其他逻辑（RANSAC、突变拒绝、HELD/LOST 跟踪器）保持原样。
+问题背景：
+  之前只要 RANSAC 拟合成功就 HELD 1.5 秒。但 min_inlier_ratio 只要 0.25，
+  在实际没有地面的场景，RANSAC 会偶然凑出一条 25%~40% 内点的低质量线，
+  照样触发 HELD —— 一不小心又凑一条，又 HELD，赖着不走。
+
+解决：
+  - 拟合成功时记住这条线的 inlier_ratio
+  - 本帧失败 / 被突变拒绝时，检查"上一条成功线"的质量：
+      inlier_ratio >= hold_min_inlier_ratio  → 高质量，值得 HELD
+      inlier_ratio <  hold_min_inlier_ratio  → 偶然凑出的低质量线，直接 LOST
+  这样真地面（ratio 通常 0.45~0.8）失败时能平滑 HELD；
+  偶然假线（ratio 0.40~0.45）失败时立刻 LOST，不赖着。
 """
 import time
 from dataclasses import dataclass, replace
@@ -118,8 +127,8 @@ def extract_ground_candidates(
     smooth_kernel: int = 3,
     max_peaks_per_row: int = 2,
     peak_min_distance: int = 3,
-    column_normalize: str = "subtract_median",
-    column_norm_percentile: float = 25.0,              # ★ 新增：百分位参数
+    column_normalize: str = "subtract_percentile",
+    column_norm_percentile: float = 50.0,              # ★ 新增：百分位参数
 ) -> np.ndarray:
     """
     每行多个局部峰值，返回 (N, 2) [y, disp]。
@@ -173,10 +182,10 @@ def extract_ground_candidates(
 def fit_ground_line_ransac(
     points: np.ndarray,
     n_iterations: int = 300,
-    residual_threshold: float = 1.5,
+    residual_threshold: float = 2.5,
     min_inliers: int = 30,
-    min_inlier_ratio: float = 0.25,
-    min_slope: float = 0.09,
+    min_inlier_ratio: float = 0.4,
+    min_slope: float = 0.12,
     max_slope: float = 0.5,
     min_y_gap_ratio: float = 0.3,
     bottom_disp_check: bool = True,
@@ -276,21 +285,26 @@ class GroundTracker:
         max_slope_jump_ratio: float = 0.6,
         max_intercept_jump: float = 15.0,
         warmup_frames: int = 3,
+        hold_min_inlier_ratio: float = 0.45,   # ★ 新增：低于此质量的拟合不配 HELD
     ):
         self.hold_seconds = hold_seconds
         self.ema_alpha = ema_alpha
         self.max_slope_jump_ratio = max_slope_jump_ratio
         self.max_intercept_jump = max_intercept_jump
         self.warmup_frames = warmup_frames
+        self.hold_min_inlier_ratio = hold_min_inlier_ratio
 
         self._smoothed: Optional[GroundLine] = None
         self._last_success_t: Optional[float] = None
         self._success_count: int = 0
+        # ★ 记住"上一条成功拟合线"的 inlier_ratio，用于判断它配不配被 HELD
+        self._last_inlier_ratio: float = 0.0
 
     def reset(self):
         self._smoothed = None
         self._last_success_t = None
         self._success_count = 0
+        self._last_inlier_ratio = 0.0
 
     def update(self, raw_line: Optional[GroundLine], now: Optional[float] = None) -> TrackedGround:
         if now is None:
@@ -321,6 +335,8 @@ class GroundTracker:
                 )
             self._last_success_t = now
             self._success_count += 1
+            # ★ 记住这条成功线的质量（用 raw_line 的 ratio，不是 smoothed 的）
+            self._last_inlier_ratio = raw_line.inlier_ratio
 
             return TrackedGround(
                 line=self._smoothed, state="LOCKED",
@@ -338,6 +354,20 @@ class GroundTracker:
                 raw_fit_succeeded=raw_fit_succeeded,
                 rejected_outlier=rejected_outlier,
             )
+
+        # ★ 质量门槛：上一条成功线如果质量不够好（inlier_ratio 太低），
+        #   说明它多半是偶然凑出来的，不值得 HELD，直接 LOST。
+        if self._last_inlier_ratio < self.hold_min_inlier_ratio:
+            self._smoothed = None
+            self._last_success_t = None
+            self._last_inlier_ratio = 0.0
+            return TrackedGround(
+                line=None, state="LOST",
+                age_seconds=float("inf"),
+                raw_fit_succeeded=raw_fit_succeeded,
+                rejected_outlier=rejected_outlier,
+            )
+
         age = now - self._last_success_t
         if age <= self.hold_seconds:
             return TrackedGround(
@@ -348,6 +378,7 @@ class GroundTracker:
             )
         self._smoothed = None
         self._last_success_t = None
+        self._last_inlier_ratio = 0.0
         return TrackedGround(
             line=None, state="LOST",
             age_seconds=age,
