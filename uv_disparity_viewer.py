@@ -1,13 +1,6 @@
 """
 uv_disparity.py — U/V-Disparity 观察 + 地面拟合
 
-本次改动（仅两处）
-==================
-1. --gnd-column-norm 增加 subtract_percentile 选项 + 新参数 --gnd-norm-pct
-   - 默认仍 subtract_median（不动你之前的默认行为）
-   - 用 --gnd-column-norm subtract_percentile --gnd-norm-pct 25 可调到 25 分位
-2. 新增 --gnd-min-useful-disp（默认 2，屏蔽 disp<2 的远景背景）
-
 其他参数和默认值未改动。
 """
 import argparse
@@ -19,42 +12,16 @@ import depthai as dai
 import numpy as np
 
 from ground_fitter import (
-    extract_ground_candidates, fit_ground_line_ransac,
-    GroundTracker, TrackedGround, estimate_ground_slope_range,
+    compute_u_disparity,
+    compute_v_disparity,
+    disparity_to_int,
+    extract_ground_candidates,
+    fit_ground_line_ransac,
+    GroundTracker,
+    TrackedGround,
+    estimate_ground_slope_range,
+    remove_ground_from_disparity,
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UV-Disparity 计算
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_v_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
-    h, _ = disp_int.shape
-    v_hist = np.zeros((h, max_disp + 1), dtype=np.uint32)
-    valid = disp_int > 0
-    for y in range(h):
-        row = disp_int[y][valid[y]]
-        if row.size:
-            v_hist[y] = np.bincount(row, minlength=max_disp + 1)[:max_disp + 1]
-    return v_hist
-
-
-def compute_u_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
-    _, w = disp_int.shape
-    u_hist = np.zeros((max_disp + 1, w), dtype=np.uint32)
-    valid = disp_int > 0
-    for x in range(w):
-        col = disp_int[:, x][valid[:, x]]
-        if col.size:
-            u_hist[:, x] = np.bincount(col, minlength=max_disp + 1)[:max_disp + 1]
-    return u_hist
-
-
-def disparity_to_int(disp_frame, max_disp, subpixel_scale=1):
-    if subpixel_scale > 1:
-        disp_int = disp_frame.astype(np.int32) // subpixel_scale
-    else:
-        disp_int = disp_frame.astype(np.int32)
-    return np.clip(disp_int, 0, max_disp)
 
 
 def render_hist(hist, axis, target_size, log_scale=True, colormap=cv2.COLORMAP_HOT):
@@ -316,7 +283,7 @@ def parse_args():
     p.add_argument("--gnd-residual", type=float, default=2.5)
     p.add_argument("--gnd-iters", type=int, default=300)
     p.add_argument("--gnd-min-inliers", type=int, default=30)
-    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.4)
+    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.35)
     p.add_argument("--gnd-y-gap", type=float, default=0.3)
     p.add_argument("--gnd-min-slope", type=float, default=0.12)
     p.add_argument("--gnd-max-slope", type=float, default=0.5)
@@ -328,9 +295,13 @@ def parse_args():
     p.add_argument("--track-slope-jump", type=float, default=0.6)
     p.add_argument("--track-intercept-jump", type=float, default=15.0)
     # ★ 新增：低于此 inlier_ratio 的拟合不配 HELD，失败即 LOST
-    p.add_argument("--track-hold-min-ratio", type=float, default=0.45,
+    p.add_argument("--track-hold-min-ratio", type=float, default=0.4,
                    help="只有 inlier_ratio >= 此值的拟合才配进入 HELD 持有"
-                        "（默认 0.45；低质量偶然拟合失败即 LOST，不赖着）")
+                        "（默认 0.4；低质量偶然拟合失败即 LOST，不赖着）")
+
+    # ★ 新增：去地面容差
+    p.add_argument("--remove-ground-tolerance", type=float, default=2.5,
+                   help="去地面时的视差容差（整数视差单位，默认 2.5，建议和 --gnd-residual 一致）")
     return p.parse_args()
 
 
@@ -409,7 +380,7 @@ def main():
     print(f" 列归一化: {norm_info}   min_useful_disp: {args.gnd_min_useful_disp}")
     print(f" HELD 质量门槛: inlier_ratio >= {args.track_hold_min_ratio}   "
           f"hold={args.track_hold_sec}s")
-    print(" 按键: [q]退出 [s]保存 [l]切换log [g]切换拟合 [r]重置跟踪")
+    print(" 按键: [q]退出 [s]保存 [l]切换log [g]切换拟合 [r]重置跟踪 [m]切换去地面窗口")
     print()
 
     if args.usb_speed == "usb2":
@@ -426,10 +397,13 @@ def main():
         cv2.namedWindow("Disparity", cv2.WINDOW_NORMAL)
         cv2.namedWindow("V-Disparity", cv2.WINDOW_NORMAL)
         cv2.namedWindow("U-Disparity", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Disparity (No Ground)", cv2.WINDOW_NORMAL)
 
         fps_count, fps_start, fps = 0, time.time(), 0.0
         latest_disp = None
         first_disp = first_v = first_u = False
+        first_nogr = False
+        show_no_ground = True   # 是否显示"去地面"窗口
         log_scale = not args.no_log
         vdisp_width = args.vdisp_width
         udisp_height = args.udisp_height
@@ -527,6 +501,34 @@ def main():
             cv2.imshow("V-Disparity", v_img)
             cv2.imshow("U-Disparity", u_img)
 
+            # ★ 去地面窗口：仅在有"可用"的地面线时去除
+            if show_no_ground:
+                if tracked.line is not None and tracked.state in ("LOCKED", "HELD"):
+                    disp_no_ground = remove_ground_from_disparity(
+                        latest_disp, tracked.line,
+                        tolerance=args.remove_ground_tolerance,
+                        subpixel_scale=subpixel_scale,
+                    )
+                    nogr_u8 = np.clip(disp_no_ground * disp_color_mul, 0, 255).astype(np.uint8)
+                    nogr_color = cv2.applyColorMap(nogr_u8, color_lut)
+                    nogr_shown = fit_to_window(nogr_color, args.window_width)
+                    removed_ratio = float((disp_no_ground == 0).sum() - (latest_disp == 0).sum()) / latest_disp.size
+                    cv2.putText(nogr_shown,
+                                f"[{tracked.state}] removed {removed_ratio*100:.1f}%  tol={args.remove_ground_tolerance:.1f}",
+                                (10, 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    # 没有地面线时直接显示原图，加个提示
+                    nogr_shown = disp_shown.copy()
+                    cv2.putText(nogr_shown, "[LOST] no ground -> raw shown",
+                                (10, 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA)
+                cv2.imshow("Disparity (No Ground)", nogr_shown)
+                if not first_nogr:
+                    cv2.resizeWindow("Disparity (No Ground)",
+                                     nogr_shown.shape[1], nogr_shown.shape[0])
+                    first_nogr = True
+
             if not first_disp:
                 cv2.resizeWindow("Disparity", disp_shown.shape[1], disp_shown.shape[0]); first_disp = True
             if not first_v:
@@ -546,6 +548,14 @@ def main():
             elif key == ord("r"):
                 tracker.reset()
                 print("[跟踪] 已重置")
+            elif key == ord("m"):
+                show_no_ground = not show_no_ground
+                if not show_no_ground:
+                    cv2.destroyWindow("Disparity (No Ground)")
+                    first_nogr = False
+                else:
+                    cv2.namedWindow("Disparity (No Ground)", cv2.WINDOW_NORMAL)
+                print(f"[显示] 去地面窗口: {'开' if show_no_ground else '关'}")
             elif key in (ord("+"), ord("=")):
                 vdisp_width = min(vdisp_width + 50, 800)
                 udisp_height = min(udisp_height + 30, 500)
