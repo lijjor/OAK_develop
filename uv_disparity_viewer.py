@@ -15,12 +15,10 @@ from ground_fitter import (
     compute_u_disparity,
     compute_v_disparity,
     disparity_to_int,
-    extract_ground_candidates,
-    fit_ground_line_ransac,
     GroundTracker,
     TrackedGround,
     estimate_ground_slope_range,
-    remove_ground_from_disparity,
+    segment_ground,
 )
 
 
@@ -363,6 +361,24 @@ def main():
         max_intercept_jump=args.track_intercept_jump,
         hold_min_inlier_ratio=args.track_hold_min_ratio,
     )
+    ground_params = {
+        "y_start_ratio": args.gnd_y_start,
+        "min_useful_disp": args.gnd_min_useful_disp,
+        "min_peak_count": args.gnd_min_peak_count,
+        "smooth_kernel": args.gnd_smooth_kernel,
+        "max_peaks_per_row": args.gnd_max_peaks,
+        "peak_min_distance": args.gnd_peak_distance,
+        "column_normalize": args.gnd_column_norm,
+        "column_norm_percentile": args.gnd_norm_pct,
+        "n_iterations": args.gnd_iters,
+        "residual_threshold": args.gnd_residual,
+        "min_inliers": args.gnd_min_inliers,
+        "min_inlier_ratio": args.gnd_min_inlier_ratio,
+        "min_y_gap_ratio": args.gnd_y_gap,
+        "min_slope": args.gnd_min_slope,
+        "max_slope": args.gnd_max_slope,
+        "min_bottom_disp": args.gnd_min_bottom_disp,
+    }
 
     norm_info = args.gnd_column_norm
     if args.gnd_column_norm == "subtract_percentile":
@@ -428,8 +444,31 @@ def main():
             disp_color = cv2.applyColorMap(disp_u8, color_lut)
             disp_shown = fit_to_window(disp_color, args.window_width)
 
-            disp_int = disparity_to_int(latest_disp, int_max_disp, subpixel_scale)
-            v_hist = compute_v_disparity(disp_int, int_max_disp)
+            tracked = TrackedGround(None, "LOST", float("inf"), False, False)
+            candidates = np.empty((0, 2), np.float32)
+            inliers_mask = None
+            disp_no_ground = latest_disp
+
+            if do_ground_fit:
+                ground_result = segment_ground(
+                    latest_disp,
+                    depth_mm=None,
+                    tracker=tracker,
+                    max_disp=int_max_disp,
+                    subpixel_scale=subpixel_scale,
+                    params=ground_params,
+                    ground_tolerance=args.remove_ground_tolerance,
+                )
+                disp_int = ground_result["disp_int"]
+                v_hist = ground_result["v_hist"]
+                tracked = ground_result["tracked"]
+                candidates = ground_result["candidates"]
+                inliers_mask = ground_result["inliers_mask"]
+                disp_no_ground = ground_result["disp_no_ground"]
+            else:
+                disp_int = disparity_to_int(latest_disp, int_max_disp, subpixel_scale)
+                v_hist = compute_v_disparity(disp_int, int_max_disp)
+
             u_hist = compute_u_disparity(disp_int, int_max_disp)
             v_img = render_hist(v_hist, "v",
                                 target_size=(vdisp_width, disp_shown.shape[0]),
@@ -438,43 +477,7 @@ def main():
                                 target_size=(disp_shown.shape[1], udisp_height),
                                 log_scale=log_scale)
 
-            tracked = TrackedGround(None, "LOST", float("inf"), False, False)
-            candidates = np.empty((0, 2), np.float32)
-            inliers_mask = None
-
             if do_ground_fit:
-                candidates = extract_ground_candidates(
-                    v_hist,
-                    y_start_ratio=args.gnd_y_start,
-                    min_useful_disp=args.gnd_min_useful_disp,
-                    min_peak_count=args.gnd_min_peak_count,
-                    smooth_kernel=args.gnd_smooth_kernel,
-                    max_peaks_per_row=args.gnd_max_peaks,
-                    peak_min_distance=args.gnd_peak_distance,
-                    column_normalize=args.gnd_column_norm,
-                    column_norm_percentile=args.gnd_norm_pct,
-                )
-                raw_line = None
-                if len(candidates) >= args.gnd_min_inliers // 2:
-                    raw_line = fit_ground_line_ransac(
-                        candidates,
-                        n_iterations=args.gnd_iters,
-                        residual_threshold=args.gnd_residual,
-                        min_inliers=args.gnd_min_inliers,
-                        min_inlier_ratio=args.gnd_min_inlier_ratio,
-                        min_slope=args.gnd_min_slope,
-                        max_slope=args.gnd_max_slope,
-                        min_y_gap_ratio=args.gnd_y_gap,
-                        min_bottom_disp=args.gnd_min_bottom_disp,
-                    )
-                tracked = tracker.update(raw_line)
-
-                if raw_line is not None and len(candidates) > 0:
-                    residuals = np.abs(
-                        candidates[:, 1] - (raw_line.slope * candidates[:, 0] + raw_line.intercept)
-                    )
-                    inliers_mask = residuals <= args.gnd_residual
-
                 overlay_ground_line(v_img, v_hist.shape, candidates, tracked, inliers_mask)
                 overlay_ground_on_disparity(disp_shown, tracked, depth_h=v_hist.shape[0])
 
@@ -501,14 +504,9 @@ def main():
             cv2.imshow("V-Disparity", v_img)
             cv2.imshow("U-Disparity", u_img)
 
-            # ★ 去地面窗口：仅在有"可用"的地面线时去除
+            # ★ 去地面窗口：仅消费算法层返回结果
             if show_no_ground:
                 if tracked.line is not None and tracked.state in ("LOCKED", "HELD"):
-                    disp_no_ground = remove_ground_from_disparity(
-                        latest_disp, tracked.line,
-                        tolerance=args.remove_ground_tolerance,
-                        subpixel_scale=subpixel_scale,
-                    )
                     nogr_u8 = np.clip(disp_no_ground * disp_color_mul, 0, 255).astype(np.uint8)
                     nogr_color = cv2.applyColorMap(nogr_u8, color_lut)
                     nogr_shown = fit_to_window(nogr_color, args.window_width)
@@ -518,7 +516,6 @@ def main():
                                 (10, 22),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
                 else:
-                    # 没有地面线时直接显示原图，加个提示
                     nogr_shown = disp_shown.copy()
                     cv2.putText(nogr_shown, "[LOST] no ground -> raw shown",
                                 (10, 22),
