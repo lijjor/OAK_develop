@@ -303,22 +303,22 @@ def parse_args():
     # ★ 列归一化：新增 subtract_percentile 选项
     p.add_argument("--gnd-column-norm",
                    choices=["subtract_percentile", "subtract_median", "subtract_min", "none"],
-                   default="subtract_median",
-                   help="V-Disparity 列归一化方法（默认 subtract_median）")
+                   default="subtract_percentile",
+                   help="V-Disparity 列归一化方法（默认 subtract_percentile）")
     # ★ 新增百分位参数
-    p.add_argument("--gnd-norm-pct", type=float, default=25.0,
-                   help="subtract_percentile 模式使用的百分位数 0-100（默认 25）")
+    p.add_argument("--gnd-norm-pct", type=float, default=50.0,
+                   help="subtract_percentile 模式使用的百分位数 0-100（默认 50）")
     # ★ 新增屏蔽远景
     p.add_argument("--gnd-min-useful-disp", type=int, default=2,
                    help="候选点最小 disparity（屏蔽远景背景，默认 2）")
 
     # RANSAC
-    p.add_argument("--gnd-residual", type=float, default=1.5)
+    p.add_argument("--gnd-residual", type=float, default=2.5)
     p.add_argument("--gnd-iters", type=int, default=300)
     p.add_argument("--gnd-min-inliers", type=int, default=30)
-    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.25)
+    p.add_argument("--gnd-min-inlier-ratio", type=float, default=0.4)
     p.add_argument("--gnd-y-gap", type=float, default=0.3)
-    p.add_argument("--gnd-min-slope", type=float, default=0.09)
+    p.add_argument("--gnd-min-slope", type=float, default=0.12)
     p.add_argument("--gnd-max-slope", type=float, default=0.5)
     p.add_argument("--gnd-min-bottom-disp", type=float, default=8.0)
 
@@ -327,6 +327,10 @@ def parse_args():
     p.add_argument("--track-ema", type=float, default=0.4)
     p.add_argument("--track-slope-jump", type=float, default=0.6)
     p.add_argument("--track-intercept-jump", type=float, default=15.0)
+    # ★ 新增：低于此 inlier_ratio 的拟合不配 HELD，失败即 LOST
+    p.add_argument("--track-hold-min-ratio", type=float, default=0.45,
+                   help="只有 inlier_ratio >= 此值的拟合才配进入 HELD 持有"
+                        "（默认 0.45；低质量偶然拟合失败即 LOST，不赖着）")
     return p.parse_args()
 
 
@@ -386,6 +390,7 @@ def main():
         ema_alpha=args.track_ema,
         max_slope_jump_ratio=args.track_slope_jump,
         max_intercept_jump=args.track_intercept_jump,
+        hold_min_inlier_ratio=args.track_hold_min_ratio,
     )
 
     norm_info = args.gnd_column_norm
@@ -402,6 +407,8 @@ def main():
     print(f" min_inlier_ratio: {args.gnd_min_inlier_ratio}   "
           f"min_bottom_disp: {args.gnd_min_bottom_disp}")
     print(f" 列归一化: {norm_info}   min_useful_disp: {args.gnd_min_useful_disp}")
+    print(f" HELD 质量门槛: inlier_ratio >= {args.track_hold_min_ratio}   "
+          f"hold={args.track_hold_sec}s")
     print(" 按键: [q]退出 [s]保存 [l]切换log [g]切换拟合 [r]重置跟踪")
     print()
 
