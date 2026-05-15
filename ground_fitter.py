@@ -3,7 +3,7 @@ ground_fitter.py — V-Disparity 地面拟合
 
 本次改动（仅 GroundTracker 一处）
 ==================================
-新增 hold_min_inlier_ratio（默认 0.45）：只有"高质量拟合"才配进入 HELD 持有。
+新增 hold_min_inlier_ratio（默认 0.4）：只有"高质量拟合"才配进入 HELD 持有。
 
 问题背景：
   之前只要 RANSAC 拟合成功就 HELD 1.5 秒。但 min_inlier_ratio 只要 0.25，
@@ -15,14 +15,44 @@ ground_fitter.py — V-Disparity 地面拟合
   - 本帧失败 / 被突变拒绝时，检查"上一条成功线"的质量：
       inlier_ratio >= hold_min_inlier_ratio  → 高质量，值得 HELD
       inlier_ratio <  hold_min_inlier_ratio  → 偶然凑出的低质量线，直接 LOST
-  这样真地面（ratio 通常 0.45~0.8）失败时能平滑 HELD；
-  偶然假线（ratio 0.40~0.45）失败时立刻 LOST，不赖着。
+  这样真地面（ratio 通常 0.4~0.8）失败时能平滑 HELD；
+  偶然假线（ratio 0.35~0.4）失败时立刻 LOST，不赖着。
 """
 import time
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import numpy as np
+
+
+def disparity_to_int(disp_frame: np.ndarray, max_disp: int, subpixel_scale: int = 1) -> np.ndarray:
+    if subpixel_scale > 1:
+        disp_int = disp_frame.astype(np.int32) // subpixel_scale
+    else:
+        disp_int = disp_frame.astype(np.int32)
+    return np.clip(disp_int, 0, max_disp)
+
+
+def compute_v_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
+    h, _ = disp_int.shape
+    v_hist = np.zeros((h, max_disp + 1), dtype=np.uint32)
+    valid = disp_int > 0
+    for y in range(h):
+        row = disp_int[y][valid[y]]
+        if row.size:
+            v_hist[y] = np.bincount(row, minlength=max_disp + 1)[:max_disp + 1]
+    return v_hist
+
+
+def compute_u_disparity(disp_int: np.ndarray, max_disp: int) -> np.ndarray:
+    _, w = disp_int.shape
+    u_hist = np.zeros((max_disp + 1, w), dtype=np.uint32)
+    valid = disp_int > 0
+    for x in range(w):
+        col = disp_int[:, x][valid[:, x]]
+        if col.size:
+            u_hist[:, x] = np.bincount(col, minlength=max_disp + 1)[:max_disp + 1]
+    return u_hist
 
 
 @dataclass
@@ -55,8 +85,8 @@ def estimate_ground_slope_range(fy_pixels, baseline_m, camera_height_m, height_h
 # ★ 列归一化：抑制 V-Disparity 中的墙体垂直亮带
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_v_hist_by_column(v_hist: np.ndarray,
-                                method: str = "subtract_median",
-                                percentile: float = 25.0) -> np.ndarray:
+                                method: str = "subtract_percentile",
+                                percentile: float = 50.0) -> np.ndarray:
     """
     对 V-Disparity 直方图每列减去某个统计量，削弱墙体垂直亮带。
 
@@ -184,7 +214,7 @@ def fit_ground_line_ransac(
     n_iterations: int = 300,
     residual_threshold: float = 2.5,
     min_inliers: int = 30,
-    min_inlier_ratio: float = 0.4,
+    min_inlier_ratio: float = 0.35,
     min_slope: float = 0.12,
     max_slope: float = 0.5,
     min_y_gap_ratio: float = 0.3,
@@ -285,7 +315,7 @@ class GroundTracker:
         max_slope_jump_ratio: float = 0.6,
         max_intercept_jump: float = 15.0,
         warmup_frames: int = 3,
-        hold_min_inlier_ratio: float = 0.45,   # ★ 新增：低于此质量的拟合不配 HELD
+        hold_min_inlier_ratio: float = 0.4,   # ★ 新增：低于此质量的拟合不配 HELD
     ):
         self.hold_seconds = hold_seconds
         self.ema_alpha = ema_alpha
@@ -385,3 +415,65 @@ class GroundTracker:
             raw_fit_succeeded=raw_fit_succeeded,
             rejected_outlier=rejected_outlier,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 地面点去除
+# ─────────────────────────────────────────────────────────────────────────────
+def remove_ground_from_disparity(
+    disparity: np.ndarray,
+    ground_line: GroundLine,
+    tolerance: float = 2.5,
+    subpixel_scale: int = 1,
+) -> np.ndarray:
+    """
+    根据已拟合的地面线，把 disparity 图里"贴着地面或更远"的像素置 0。
+
+    原理：
+      对每个像素 (y, x)：
+        ground_disp = slope * y + intercept   # 这一行的地面理论视差
+        actual_disp = disparity[y, x]
+        如果 actual_disp <= ground_disp + tolerance  →  地面/背景，置 0
+        如果 actual_disp >  ground_disp + tolerance  →  障碍物（站在地上），保留
+
+      "<=" 而不是 "in ± tolerance"：比地面线小的视差表示更远，仍归为地面或背景，
+      一并剔除。只有"比地面更近"（视差更大）的像素才是真的障碍物。
+
+    参数：
+      disparity      : 原始 disparity 图（任意整数 dtype，含 subpixel 时也行）
+      ground_line    : 拟合得到的 GroundLine（slope/intercept 都是整数视差单位）
+      tolerance      : 容差（整数视差单位，建议和 RANSAC 的 residual_threshold 一致）
+      subpixel_scale : 如果 disparity 是 subpixel（× 32 整数存储），传 32；否则 1
+
+    返回：
+      与 disparity 同 shape 同 dtype，地面像素已置 0 的新数组。原数组不动。
+      原本就是 0 的像素（无效区域）保持 0。
+    """
+    if ground_line is None:
+        return disparity.copy()
+
+    h, w = disparity.shape
+
+    # 在"整数视差"尺度上算地面线，所以要把当前 disparity 也换算到整数视差
+    if subpixel_scale > 1:
+        disp_int = disparity.astype(np.float32) / subpixel_scale
+    else:
+        disp_int = disparity.astype(np.float32)
+
+    # 每一行的地面理论视差：shape (h,)
+    y_idx = np.arange(h, dtype=np.float32)
+    ground_disp_per_row = ground_line.slope * y_idx + ground_line.intercept  # (h,)
+
+    # 阈值：每行允许的"最远"视差。低于等于此值都判为地面。
+    threshold_per_row = ground_disp_per_row + tolerance  # (h,)
+
+    # 广播到 (h, w)
+    threshold = threshold_per_row[:, None]
+
+    # 地面 mask：actual <= threshold 且 actual > 0（排除原本就无效的）
+    valid = disparity > 0
+    ground_mask = (disp_int <= threshold) & valid
+
+    out = disparity.copy()
+    out[ground_mask] = 0
+    return out
