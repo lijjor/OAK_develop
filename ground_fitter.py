@@ -20,7 +20,7 @@ ground_fitter.py — V-Disparity 地面拟合
 """
 import time
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -417,6 +417,115 @@ class GroundTracker:
         )
 
 
+def compute_ground_mask_from_disparity(
+    disparity: np.ndarray,
+    ground_line: Optional[GroundLine],
+    tolerance: float = 2.5,
+    subpixel_scale: int = 1,
+) -> np.ndarray:
+    if ground_line is None:
+        return np.zeros(disparity.shape, dtype=bool)
+
+    if subpixel_scale > 1:
+        disp_int = disparity.astype(np.float32) / subpixel_scale
+    else:
+        disp_int = disparity.astype(np.float32)
+
+    y_idx = np.arange(disparity.shape[0], dtype=np.float32)
+    threshold = (ground_line.slope * y_idx + ground_line.intercept + tolerance)[:, None]
+    valid = disparity > 0
+    return (disp_int <= threshold) & valid
+
+
+def remove_ground_from_depth(depth_mm: np.ndarray, ground_mask: np.ndarray) -> np.ndarray:
+    out = depth_mm.copy()
+    out[ground_mask] = 0
+    return out
+
+
+def estimate_tracked_ground(
+    disparity: np.ndarray,
+    tracker: GroundTracker,
+    max_disp: int,
+    subpixel_scale: int = 1,
+    params: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    p = params or {}
+    disp_int = disparity_to_int(disparity, max_disp, subpixel_scale)
+    v_hist = compute_v_disparity(disp_int, max_disp)
+    candidates = extract_ground_candidates(
+        v_hist,
+        y_start_ratio=p.get("y_start_ratio", 0.45),
+        min_useful_disp=p.get("min_useful_disp", 2),
+        min_peak_count=p.get("min_peak_count", 5),
+        smooth_kernel=p.get("smooth_kernel", 3),
+        max_peaks_per_row=p.get("max_peaks_per_row", 2),
+        peak_min_distance=p.get("peak_min_distance", 3),
+        column_normalize=p.get("column_normalize", "subtract_percentile"),
+        column_norm_percentile=p.get("column_norm_percentile", 50.0),
+    )
+    raw_line = None
+    min_inliers = int(p.get("min_inliers", 30))
+    residual_threshold = float(p.get("residual_threshold", 2.5))
+    if len(candidates) >= max(2, min_inliers // 2):
+        raw_line = fit_ground_line_ransac(
+            candidates,
+            n_iterations=p.get("n_iterations", 300),
+            residual_threshold=residual_threshold,
+            min_inliers=min_inliers,
+            min_inlier_ratio=p.get("min_inlier_ratio", 0.35),
+            min_slope=p.get("min_slope", 0.12),
+            max_slope=p.get("max_slope", 0.5),
+            min_y_gap_ratio=p.get("min_y_gap_ratio", 0.3),
+            min_bottom_disp=p.get("min_bottom_disp", 8.0),
+        )
+    tracked = tracker.update(raw_line, now=now)
+    inliers_mask = None
+    if raw_line is not None and len(candidates) > 0:
+        residuals = np.abs(candidates[:, 1] - (raw_line.slope * candidates[:, 0] + raw_line.intercept))
+        inliers_mask = residuals <= residual_threshold
+    return {"disp_int": disp_int, "v_hist": v_hist, "candidates": candidates, "raw_line": raw_line, "tracked": tracked, "inliers_mask": inliers_mask}
+
+
+def segment_ground(
+    disparity: np.ndarray,
+    depth_mm: Optional[np.ndarray],
+    tracker: GroundTracker,
+    max_disp: int,
+    subpixel_scale: int = 1,
+    params: Optional[Dict[str, Any]] = None,
+    ground_tolerance: float = 2.5,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    result = estimate_tracked_ground(
+        disparity,
+        tracker,
+        max_disp,
+        subpixel_scale=subpixel_scale,
+        params=params,
+        now=now,
+    )
+    tracked = result["tracked"]
+    if tracked.line is not None and tracked.state in ("LOCKED", "HELD"):
+        ground_mask = compute_ground_mask_from_disparity(
+            disparity,
+            tracked.line,
+            tolerance=ground_tolerance,
+            subpixel_scale=subpixel_scale,
+        )
+    else:
+        ground_mask = np.zeros(disparity.shape, dtype=bool)
+
+    disp_no_ground = disparity.copy()
+    disp_no_ground[ground_mask] = 0
+
+    result["ground_mask"] = ground_mask
+    result["disp_no_ground"] = disp_no_ground
+    result["depth_no_ground"] = None if depth_mm is None else remove_ground_from_depth(depth_mm, ground_mask)
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 地面点去除
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,28 +561,12 @@ def remove_ground_from_disparity(
     if ground_line is None:
         return disparity.copy()
 
-    h, w = disparity.shape
-
-    # 在"整数视差"尺度上算地面线，所以要把当前 disparity 也换算到整数视差
-    if subpixel_scale > 1:
-        disp_int = disparity.astype(np.float32) / subpixel_scale
-    else:
-        disp_int = disparity.astype(np.float32)
-
-    # 每一行的地面理论视差：shape (h,)
-    y_idx = np.arange(h, dtype=np.float32)
-    ground_disp_per_row = ground_line.slope * y_idx + ground_line.intercept  # (h,)
-
-    # 阈值：每行允许的"最远"视差。低于等于此值都判为地面。
-    threshold_per_row = ground_disp_per_row + tolerance  # (h,)
-
-    # 广播到 (h, w)
-    threshold = threshold_per_row[:, None]
-
-    # 地面 mask：actual <= threshold 且 actual > 0（排除原本就无效的）
-    valid = disparity > 0
-    ground_mask = (disp_int <= threshold) & valid
-
+    ground_mask = compute_ground_mask_from_disparity(
+        disparity,
+        ground_line,
+        tolerance=tolerance,
+        subpixel_scale=subpixel_scale,
+    )
     out = disparity.copy()
     out[ground_mask] = 0
     return out
