@@ -157,10 +157,8 @@ _MEDIAN_MAP = {
 }
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="OAK 深度采集 + 三区避障")
-
-    # 深度参数
+def add_common_depth_args(p):
+    """添加会影响原始 depth/disparity 输出链路的公共参数。"""
     p.add_argument("--resolution", choices=list(_RESOLUTION_MAP.keys()), default="400p")
     p.add_argument("--confidence", type=int, default=240)
     p.add_argument("--median", choices=list(_MEDIAN_MAP.keys()), default="7")
@@ -175,6 +173,37 @@ def parse_args():
     p.add_argument("--spatial-iter", type=int, default=1)
     p.add_argument("--aggressive", action="store_true")
     p.add_argument("--no-threshold", action="store_true")
+    p.add_argument("--colormap", choices=["JET", "TURBO", "HOT", "VIRIDIS"], default="JET")
+    p.add_argument("--window-width", type=int, default=720)
+    p.add_argument("--max-display-mm", type=int, default=8000)
+    p.add_argument("--save-dir", type=str, default="")
+    p.add_argument("--usb-speed", choices=["auto", "usb2", "usb3"], default="auto")
+
+
+def create_device_context(pipeline, usb_speed):
+    """统一 Device 上下文创建，保证不同入口的 USB 连接逻辑一致。"""
+    if usb_speed == "usb2":
+        return dai.Device(pipeline, dai.UsbSpeed.HIGH)
+    if usb_speed == "usb3":
+        return dai.Device(pipeline, dai.UsbSpeed.SUPER)
+    return dai.Device(pipeline)
+
+
+def update_latest_stereo_frames(depth_q, disp_q, latest_depth, latest_disp):
+    """统一 depth/disparity 取帧顺序与最新帧更新逻辑。"""
+    in_disp = disp_q.tryGet()
+    in_depth = depth_q.tryGet()
+    if in_disp is not None:
+        latest_disp = in_disp.getFrame()
+    if in_depth is not None:
+        latest_depth = in_depth.getFrame()
+    return latest_depth, latest_disp
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="OAK 深度采集 + 三区避障")
+
+    add_common_depth_args(p)
 
     # ★ 避障参数
     p.add_argument("--no-avoid", action="store_true", help="关闭避障算法")
@@ -187,12 +216,6 @@ def parse_args():
     p.add_argument("--roi-top",    type=float, default=0.20, help="ROI 顶部裁剪比例")
     p.add_argument("--roi-bottom", type=float, default=0.85, help="ROI 底部裁剪比例")
 
-    # 显示
-    p.add_argument("--colormap", choices=["JET", "TURBO", "HOT", "VIRIDIS"], default="JET")
-    p.add_argument("--window-width", type=int, default=720)
-    p.add_argument("--max-display-mm", type=int, default=8000)
-    p.add_argument("--save-dir", type=str, default="")
-    p.add_argument("--usb-speed", choices=["auto", "usb2", "usb3"], default="auto")
     return p.parse_args()
 
 
@@ -258,12 +281,7 @@ def main():
     print(" 按键: [q] 退出   [s] 保存当前帧")
     print()
 
-    if args.usb_speed == "usb2":
-        device_ctx = dai.Device(pipeline, dai.UsbSpeed.HIGH)
-    elif args.usb_speed == "usb3":
-        device_ctx = dai.Device(pipeline, dai.UsbSpeed.SUPER)
-    else:
-        device_ctx = dai.Device(pipeline)
+    device_ctx = create_device_context(pipeline, args.usb_speed)
 
     with device_ctx as device:
         print(f"USB: {device.getUsbSpeed()}")
@@ -278,12 +296,9 @@ def main():
         first_shown = False
 
         while True:
-            in_disp = disp_q.tryGet()
-            in_depth = depth_q.tryGet()
-            if in_disp is not None:
-                latest_disp = in_disp.getFrame()
-            if in_depth is not None:
-                latest_depth = in_depth.getFrame()
+            latest_depth, latest_disp = update_latest_stereo_frames(
+                depth_q, disp_q, latest_depth, latest_disp
+            )
             if latest_disp is None or latest_depth is None:
                 continue
 
