@@ -11,7 +11,7 @@ import cv2
 import depthai as dai
 import numpy as np
 
-from ground_fitter import (
+from ground_filter import (
     compute_u_disparity,
     compute_v_disparity,
     disparity_to_int,
