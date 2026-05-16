@@ -498,6 +498,14 @@ def segment_ground(
     ground_tolerance: float = 2.5,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """
+    Layer 1 统一入口：识别地面，并输出 ground_mask / disp_no_ground / depth_no_ground。
+
+    约定：
+      - 地面识别、去地面都在本层完成
+      - 下游 Layer 2（height_filter）应优先消费 depth_no_ground
+      - 若 depth_mm is None，则仅返回 disparity 侧结果，便于 uv_disparity_viewer 做可视化
+    """
     result = estimate_tracked_ground(
         disparity,
         tracker,
